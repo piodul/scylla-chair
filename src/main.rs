@@ -2,6 +2,7 @@ mod configuration;
 mod distribution;
 mod generator;
 mod run;
+mod sharded_histogram;
 mod workload;
 
 use std::num::{NonZeroU64, NonZeroUsize};

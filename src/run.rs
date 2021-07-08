@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use anyhow::{Error, Result};
 use futures::FutureExt;
+use histogram::Histogram;
 use scylla::{Session, SessionBuilder};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::configuration::BenchDescription;
+use crate::sharded_histogram::ShardedHistogram;
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const CATCH_UPPER_INTERVAL: Duration = Duration::from_millis(100);
@@ -18,6 +20,7 @@ struct WorkerContext {
     next_operation_id: AtomicU64,
 
     rate_limiter: Option<RateLimiter>,
+    histogram: ShardedHistogram,
 }
 
 struct RateLimiter {
@@ -83,6 +86,7 @@ impl WorkerContext {
             config,
             next_operation_id: 0.into(),
             rate_limiter,
+            histogram: ShardedHistogram::new(Default::default()),
         }
     }
 
@@ -112,6 +116,17 @@ impl WorkerContext {
         if let Some(limiter) = &self.rate_limiter {
             limiter.run_catch_upper().await
         }
+    }
+
+    pub fn mark_latency(&self, latency: Duration) {
+        let _ = self
+            .histogram
+            .get_shard_mut()
+            .increment(latency.as_micros() as u64);
+    }
+
+    pub fn get_combined_histogram_and_clear(&self) -> Histogram {
+        self.histogram.get_combined_and_clear()
     }
 }
 
@@ -154,7 +169,15 @@ impl ProgressReporter {
 
         let ops_per_sec = ops_delta as f64 / time_delta.as_secs_f64();
 
-        println!("{:?}: {} {}ops/s", elapsed, ops_done, ops_per_sec);
+        let hist = self.context.get_combined_histogram_and_clear();
+        let p50 = hist.percentile(50.0).unwrap_or(0) as f64 / 1000.0;
+        let p95 = hist.percentile(95.0).unwrap_or(0) as f64 / 1000.0;
+        let p99 = hist.percentile(99.0).unwrap_or(0) as f64 / 1000.0;
+
+        println!(
+            "{:?}: {} {}ops/s {:.3}ms {:.3}ms {:.3}ms",
+            elapsed, ops_done, ops_per_sec, p50, p95, p99
+        );
 
         self.previous_ops = ops_done;
         self.previous_report_time = now;
@@ -186,14 +209,21 @@ pub async fn run(config: Arc<BenchDescription>) -> Result<()> {
         handles.push(async move {
             let res: Result<Result<()>, tokio::task::JoinError> = tokio::spawn(async move {
                 while let Some(op_id) = context.issue_operation_id() {
-                    let op_id = op_id as i64;
                     context.rate_limit().await;
+
+                    // TODO: Adjust for coordinated omission
+                    let op_id = op_id as i64;
+                    let start = Instant::now();
+
                     if let Err(err) = session
                         .execute(&prepared_stmt, (op_id, 2 * op_id, 3 * op_id))
                         .await
                     {
                         println!("Failed to perform an operation: {:?}", err);
                     }
+
+                    let end = Instant::now();
+                    context.mark_latency(end - start);
                 }
                 Ok(())
             })
