@@ -5,7 +5,7 @@ use rand::distributions::Distribution as RandDistribution;
 use rand_distr::Uniform;
 use rand_pcg::Pcg64Mcg;
 
-type RngGen = Pcg64Mcg;
+pub type RngGen = Pcg64Mcg;
 
 pub struct DistributionContext {
     seq: u64,

@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate async_trait;
+
 mod configuration;
 mod distribution;
 mod generator;
@@ -12,7 +15,8 @@ use configuration::{scylla_bench, BenchDescription};
 
 #[tokio::main]
 async fn main() {
-    let bench_desc = scylla_bench::parse_scylla_bench_args(std::env::args()).unwrap();
+    let (bench_desc, bench_strategy) =
+        scylla_bench::parse_scylla_bench_args(std::env::args()).unwrap();
 
     // TODO: Support parsing cassandra-stress style arguments
     // let config = Arc::new(BenchDescription {
@@ -23,5 +27,5 @@ async fn main() {
     //     nodes: vec!["127.0.0.1:9042".to_owned()],
     // });
 
-    run::run(bench_desc).await.unwrap();
+    run::run(bench_desc, bench_strategy).await.unwrap();
 }

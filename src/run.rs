@@ -9,7 +9,8 @@ use scylla::{Session, SessionBuilder};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::configuration::BenchDescription;
+use crate::configuration::{BenchDescription, BenchStrategy};
+use crate::distribution::{DistributionContext, RngGen};
 use crate::sharded_histogram::ShardedHistogram;
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
@@ -187,7 +188,7 @@ impl ProgressReporter {
     }
 }
 
-pub async fn run(config: Arc<BenchDescription>) -> Result<()> {
+pub async fn run(config: Arc<BenchDescription>, strategy: Arc<dyn BenchStrategy>) -> Result<()> {
     let session = SessionBuilder::new()
         .known_nodes(&config.nodes)
         .tcp_nodelay(false) // TODO: Make configurable
@@ -196,30 +197,34 @@ pub async fn run(config: Arc<BenchDescription>) -> Result<()> {
 
     let session = Arc::new(session);
 
-    let stmt = "INSERT INTO ks.tbl (pk, v1, v2) VALUES (?, ?, ?)";
-    let prepared_stmt = Arc::new(session.prepare(stmt).await?);
-
-    // TODO: Prepare schema here
+    let op = strategy.prepare(session.clone()).await?;
 
     let context = Arc::new(WorkerContext::new(config.clone()));
     let mut handles = Vec::with_capacity(config.concurrency.into());
 
     for _ in 0usize..config.concurrency.into() {
         let context = context.clone();
-        let session = session.clone();
-        let prepared_stmt = prepared_stmt.clone();
+        let op = op.clone();
 
         handles.push(async move {
             let res: Result<Result<()>, tokio::task::JoinError> = tokio::spawn(async move {
+                let mut prev_op_id = 0;
+                let mut gen = RngGen::new(0); // TODO: Support seeding
+
                 while let Some(op_id) = context.issue_operation_id() {
-                    let op_id = op_id as i64;
                     let start = context.rate_limit().await;
 
-                    if let Err(err) = session
-                        .execute(&prepared_stmt, (op_id, 2 * op_id, 3 * op_id))
-                        .await
-                    {
-                        println!("Failed to perform an operation: {:?}", err);
+                    gen.advance(((op_id - prev_op_id) * 1024) as u128);
+                    prev_op_id = op_id;
+
+                    let ctx = DistributionContext::new(op_id, gen.clone());
+
+                    match op.execute(ctx).await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(err) => {
+                            println!("Failed to perform an operation: {:?}", err);
+                        }
                     }
 
                     let end = Instant::now();
