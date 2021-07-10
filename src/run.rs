@@ -38,13 +38,14 @@ impl RateLimiter {
         }
     }
 
-    pub async fn wait(&self) {
+    pub async fn wait(&self) -> Instant {
         let micros = self
             .microseconds
             .fetch_add(self.increment, Ordering::Relaxed);
         let start_at = self.base + Duration::from_micros(micros);
 
         tokio::time::sleep_until(start_at).await;
+        start_at
     }
 
     // Runs an asynchronous process which will add microseconds
@@ -106,9 +107,11 @@ impl WorkerContext {
         id.saturating_sub(self.config.concurrency.get() as u64)
     }
 
-    pub async fn rate_limit(&self) {
+    pub async fn rate_limit(&self) -> Instant {
         if let Some(limiter) = &self.rate_limiter {
             limiter.wait().await
+        } else {
+            Instant::now()
         }
     }
 
@@ -209,11 +212,8 @@ pub async fn run(config: Arc<BenchDescription>) -> Result<()> {
         handles.push(async move {
             let res: Result<Result<()>, tokio::task::JoinError> = tokio::spawn(async move {
                 while let Some(op_id) = context.issue_operation_id() {
-                    context.rate_limit().await;
-
-                    // TODO: Adjust for coordinated omission
                     let op_id = op_id as i64;
-                    let start = Instant::now();
+                    let start = context.rate_limit().await;
 
                     if let Err(err) = session
                         .execute(&prepared_stmt, (op_id, 2 * op_id, 3 * op_id))
