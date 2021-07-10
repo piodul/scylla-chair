@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Result;
+use scylla::frame::types::Consistency;
 
 use crate::configuration::BenchDescription;
 use crate::distribution::{self, Distribution, FixedDistribution};
@@ -26,7 +27,12 @@ pub fn parse_scylla_bench_args(
         |s| Ok(Some(s.parse()?)),
     );
     let workload = flag.string_var("workload", "", "workload: sequential, uniform, timeseries");
-    let consistency_level = flag.string_var("consistency-level", "", "consistency level");
+    let consistency_level = flag.var(
+        "consistency-level",
+        Consistency::Quorum,
+        "consistency level",
+        parse_consistency,
+    );
     let replication_factor = flag.u64_var("replication-factor", 1, "replication factor");
     // timeout
 
@@ -105,6 +111,21 @@ pub fn parse_scylla_bench_args(
     });
 
     Ok(ret)
+}
+
+fn parse_consistency(s: &str) -> Result<Consistency> {
+    match s {
+        "any" => Ok(Consistency::Any),
+        "one" => Ok(Consistency::One),
+        "two" => Ok(Consistency::Two),
+        "three" => Ok(Consistency::Three),
+        "quorum" => Ok(Consistency::Quorum),
+        "all" => Ok(Consistency::All),
+        "local_quorum" => Ok(Consistency::LocalQuorum),
+        "each_quorum" => Ok(Consistency::EachQuorum),
+        "local_one" => Ok(Consistency::LocalOne),
+        _ => Err(anyhow::anyhow!("Invalid consistency: {:?}", s)),
+    }
 }
 
 #[derive(Copy, Clone)]
