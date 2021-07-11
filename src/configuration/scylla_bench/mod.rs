@@ -4,6 +4,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use anyhow::Result;
+use rand_distr::{Distribution as _, Uniform};
 use scylla::frame::types::Consistency;
 use scylla::statement::prepared_statement::PreparedStatement;
 use scylla::Session;
@@ -26,7 +27,12 @@ pub fn parse_scylla_bench_args(
         "operating mode: write, read, counter_update, counter_read, scan",
         |s| Ok(Some(s.parse()?)),
     );
-    let workload = flag.string_var("workload", "", "workload: sequential, uniform, timeseries");
+    let workload_type: FlagValue<Option<WorkloadType>> = flag.var(
+        "workload",
+        None,
+        "workload: sequential, uniform, timeseries",
+        |s| Ok(Some(s.parse()?)),
+    );
     let consistency_level = flag.var(
         "consistency-level",
         Consistency::Quorum,
@@ -55,7 +61,7 @@ pub fn parse_scylla_bench_args(
     );
     let default_dist: Arc<dyn Distribution> = Arc::new(FixedDistribution(4));
     let clustering_row_size_dist = flag.var(
-        "clustering-row-size-dist",
+        "clustering-row-size",
         default_dist,
         "size of a single clustering row, can use random values",
         |s| Ok(distribution::parse_distribution(s)?.into()),
@@ -106,6 +112,14 @@ pub fn parse_scylla_bench_args(
     args.next();
     flag.parse_args(args)?;
 
+    let mode = mode
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Test mode needs to be specified"))?;
+
+    let workload_type = workload_type
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Workload needs to be specified"))?;
+
     let desc = Arc::new(BenchDescription {
         operation_count: partition_count.get() * clustering_row_count.get(),
         concurrency: NonZeroUsize::new(concurrency.get() as usize).unwrap(), // TODO: Fix unwrap
@@ -124,7 +138,8 @@ pub fn parse_scylla_bench_args(
 
         clustering_row_size_dist: clustering_row_size_dist.get(),
 
-        mode: mode.get().unwrap(),
+        mode,
+        workload_type,
     });
 
     Ok((desc, strategy))
@@ -169,6 +184,28 @@ impl std::str::FromStr for Mode {
     }
 }
 
+#[derive(Copy, Clone)]
+enum WorkloadType {
+    Sequential,
+    Uniform,
+    TimeSeries,
+    Scan,
+}
+
+impl std::str::FromStr for WorkloadType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "sequential" => Ok(WorkloadType::Sequential),
+            "uniform" => Ok(WorkloadType::Uniform),
+            "timeseries" => Ok(WorkloadType::TimeSeries),
+            "scan" => Ok(WorkloadType::Scan),
+            _ => Err(anyhow::anyhow!("Invalid workload type: {:?}", s)),
+        }
+    }
+}
+
 struct ScyllaBenchStrategy {
     keyspace: String,
     table: String,
@@ -181,6 +218,7 @@ struct ScyllaBenchStrategy {
     clustering_row_size_dist: Arc<dyn Distribution>,
 
     mode: Mode,
+    workload_type: WorkloadType,
 }
 
 #[async_trait]
@@ -206,13 +244,22 @@ impl BenchStrategy for ScyllaBenchStrategy {
         );
         let statement = session.prepare(insert_statement).await?;
 
-        let workload = SequentialWorkload {
-            iterations: self.iterations,
-            pks: self.partition_count,
-            cks_per_call: 1, // TODO: Support batches
-            calls_per_pk: self.clustering_row_count,
+        let workload: Box<dyn Workload> = match self.workload_type {
+            WorkloadType::Sequential => Box::new(SequentialWorkload {
+                iterations: self.iterations,
+                pks: self.partition_count,
+                cks_per_call: 1, // TODO: Support batches
+                calls_per_pk: self.clustering_row_count,
+            }),
+
+            WorkloadType::Uniform => Box::new(UniformWorkload {
+                pk_distribution: Uniform::new(0, self.partition_count as i64),
+                ck_distribution: Uniform::new(0, self.clustering_row_count as i64),
+                cks_per_call: 1, // TODO: Support batches
+            }),
+
+            _ => todo!("Timeseries and Scan workloads are not implemented"),
         };
-        let workload = Box::new(workload);
 
         // TODO: Support other workload modes
         let op = WriteOp {
@@ -242,6 +289,7 @@ impl BenchOp for WriteOp {
             Some(x) => x,
         };
 
+        debug_assert!(!cks.is_empty());
         if cks.len() == 1 {
             let clustering_row_len = self.clustering_row_size_dist.get_u64(&mut ctx) as usize;
             let data = generate_row_data(pk, cks[0], clustering_row_len);
@@ -284,6 +332,23 @@ impl Workload for SequentialWorkload {
             .map(|x| x as i64)
             .collect();
         Some((pk as i64, v))
+    }
+}
+
+struct UniformWorkload {
+    pk_distribution: Uniform<i64>,
+    ck_distribution: Uniform<i64>,
+    cks_per_call: u64,
+}
+
+impl Workload for UniformWorkload {
+    fn get(&self, ctx: &mut DistributionContext) -> Option<(i64, Vec<i64>)> {
+        let pk = self.pk_distribution.sample(ctx.get_gen_mut());
+        let mut v = Vec::with_capacity(self.cks_per_call as usize);
+        for _ in 0..self.cks_per_call {
+            v.push(self.ck_distribution.sample(ctx.get_gen_mut()));
+        }
+        Some((pk, v))
     }
 }
 

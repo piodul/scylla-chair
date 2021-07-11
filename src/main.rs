@@ -15,6 +15,8 @@ use configuration::{scylla_bench, BenchDescription};
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let (bench_desc, bench_strategy) =
         scylla_bench::parse_scylla_bench_args(std::env::args()).unwrap();
 
