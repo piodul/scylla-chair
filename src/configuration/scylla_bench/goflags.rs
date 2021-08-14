@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -81,6 +82,18 @@ impl GoFlagSet {
         Ok(())
     }
 
+    pub fn print_help(&self, program_name: &str) {
+        println!("Usage of {}:", program_name);
+        let mut flag_names: Vec<&str> = self.flags.keys().copied().collect();
+        flag_names.sort_unstable();
+
+        for fname in flag_names {
+            let flag = self.flags.get(&fname).unwrap();
+            println!("  -{}", fname);
+            println!("        {}", flag.desc);
+        }
+    }
+
     pub fn bool_var(
         &mut self,
         name: &'static str,
@@ -127,6 +140,15 @@ impl GoFlagSet {
         self.add_flag(name, false, default, desc, |s| Ok(s.parse()?))
     }
 
+    pub fn duration_var(
+        &mut self,
+        name: &'static str,
+        default: Duration,
+        desc: &'static str,
+    ) -> FlagValue<Duration> {
+        self.add_flag(name, false, default, desc, parse_duration)
+    }
+
     pub fn var<T: Clone + 'static>(
         &mut self,
         name: &'static str,
@@ -161,4 +183,97 @@ impl GoFlagSet {
         );
         FlagValue::new(target)
     }
+}
+
+static UNIT_MULTIPLICANDS: &[(&str, f64)] = &[
+    ("ns", 1.0),
+    ("us", 1_000.0),
+    ("µs", 1_000.0), // U+00B5 = micro symbol
+    ("μs", 1_000.0), // U+03BC = Greek letter mu
+    ("ms", 1_000_000.0),
+    ("s", 1_000_000_000.0),
+    ("m", 60.0 * 1_000_000_000.0),
+    ("h", 60.0 * 60.0 * 1_000_000_000.0),
+];
+
+// Reimplementation of Go's time.ParseDuration
+// Not exactly the same, but should be enough
+// TODO: There might be some precision issues with hour fractions
+fn parse_duration(mut s: &str) -> Result<Duration> {
+    let original = s;
+    let mut nanos = 0u128;
+
+    // We don't support negative durations! We don't need them, and Rust's duration
+    // does not permit negative durations either.
+    if s.starts_with('-') {
+        return Err(anyhow::anyhow!("negative durations are not supported"));
+    } else if s.starts_with('+') {
+        s = s.get(1..).unwrap();
+    }
+
+    // Special case for unitless 0
+    if s == "0" {
+        return Ok(Duration::ZERO);
+    }
+
+    if s.is_empty() {
+        return Err(anyhow::anyhow!("invalid duration: {}", original));
+    }
+
+    while !s.is_empty() {
+        // Consume a number (possibly floating point)
+        let number_end = s
+            .find(|c: char| c != '.' && !c.is_digit(10))
+            .unwrap_or(s.len());
+        let (number_s, rest) = s.split_at(number_end);
+        let number = number_s.parse::<f64>()?;
+        s = rest;
+
+        // Consume a unit
+        let unit_end = s
+            .find(|c: char| c == '.' || c.is_digit(10))
+            .unwrap_or(s.len());
+        let (unit, rest) = s.split_at(unit_end);
+        let unit_multiplicand = UNIT_MULTIPLICANDS
+            .iter()
+            .find_map(|(uname, mult)| if &unit == uname { Some(mult) } else { None })
+            .ok_or_else(|| anyhow::anyhow!("invalid duration unit: {}", unit))?;
+        s = rest;
+
+        // TODO: Handle overflow here
+        nanos += (number * unit_multiplicand) as u128;
+    }
+
+    if nanos == 0 {
+        return Ok(Duration::ZERO);
+    }
+
+    // Rust's API does not permit constructing durations from u128 numbers, only u64.
+    // Duration holds 96 bits internally, so by providing only the lowest 64 bits
+    // we might lose some information.
+    // Therefore, here we construct the duration manually.
+
+    let mask = (1u128 << 64) - 1;
+    let mut ret = Duration::from_nanos((nanos & mask) as u64);
+    nanos >>= 64;
+
+    if nanos > 0 {
+        // The duration did not fit in 64 bits
+        let mut high_part = Duration::from_nanos(nanos as u64);
+
+        // We have to shift the high part by 64 bits, but we can multiply
+        // by u32 numbers only, therefore we have to take three steps
+
+        for step in [31, 31, 2] {
+            high_part = high_part
+                .checked_mul(1 << step)
+                .ok_or_else(|| anyhow::anyhow!("duration overflow"))?;
+        }
+
+        ret = ret
+            .checked_add(high_part)
+            .ok_or_else(|| anyhow::anyhow!("duration overflow"))?;
+    }
+
+    Ok(ret)
 }

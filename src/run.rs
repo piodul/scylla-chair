@@ -3,10 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Error, Result};
-use futures::FutureExt;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use histogram::Histogram;
 use scylla::{Session, SessionBuilder};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::configuration::{BenchDescription, BenchStrategy};
@@ -22,34 +21,38 @@ struct WorkerContext {
 
     rate_limiter: Option<RateLimiter>,
     histogram: ShardedHistogram,
+
+    start_time: Instant,
 }
 
 struct RateLimiter {
     base: Instant,
     increment: u64,
-    microseconds: AtomicU64,
+    nanoseconds: AtomicU64,
 }
 
 impl RateLimiter {
     pub fn new(base: Instant, ops_per_sec: u64) -> Self {
         Self {
-            microseconds: 0.into(),
+            nanoseconds: 0.into(),
             base,
-            increment: 1_000_000 / ops_per_sec,
+            increment: 1_000_000_000 / ops_per_sec,
         }
     }
 
     pub async fn wait(&self) -> Instant {
-        let micros = self
-            .microseconds
+        let nanos = self
+            .nanoseconds
             .fetch_add(self.increment, Ordering::Relaxed);
-        let start_at = self.base + Duration::from_micros(micros);
+        let start_at = self.base + Duration::from_nanos(nanos);
 
         tokio::time::sleep_until(start_at).await;
-        start_at
+
+        let now = Instant::now();
+        std::cmp::max(start_at, now)
     }
 
-    // Runs an asynchronous process which will add microseconds
+    // Runs an asynchronous process which will add nanoseconds
     // if it observes that we are lagging too much behind.
     // This should help in situations when Cassandra/Scylla is overloaded
     // for some time and we can't achieve configured rate, but then it stops
@@ -64,37 +67,46 @@ impl RateLimiter {
         loop {
             tokio::time::sleep(CATCH_UPPER_INTERVAL).await;
             let now = Instant::now();
-            let micros = self.microseconds.load(Ordering::Relaxed);
-            let status = self.base + Duration::from_micros(micros);
+            let nanos = self.nanoseconds.load(Ordering::Relaxed);
+            let status = self.base + Duration::from_nanos(nanos);
             let lag = now
                 .checked_duration_since(status)
                 .unwrap_or_else(|| Duration::from_secs(0));
 
             if lag > max_allowed_lag {
-                let adjustment = (lag - max_allowed_lag).as_micros() as u64;
-                self.microseconds.fetch_add(adjustment, Ordering::Relaxed);
+                let adjustment = (lag - max_allowed_lag).as_nanos() as u64;
+                self.nanoseconds.fetch_add(adjustment, Ordering::Relaxed);
             }
         }
     }
 }
 
+const INVALID_OP_BIT: u64 = 1 << 63;
+
 impl WorkerContext {
     pub fn new(config: Arc<BenchDescription>) -> Self {
+        let now = Instant::now();
+
         let rate_limiter = config
             .rate_limit_per_second
-            .map(|limit| RateLimiter::new(Instant::now(), limit.get()));
+            .map(|limit| RateLimiter::new(now, limit.get()));
 
         Self {
             config,
             next_operation_id: 0.into(),
             rate_limiter,
             histogram: ShardedHistogram::new(Default::default()),
+            start_time: now,
         }
+    }
+
+    pub fn get_start_time(&self) -> Instant {
+        self.start_time
     }
 
     pub fn issue_operation_id(&self) -> Option<u64> {
         let id = self.next_operation_id.fetch_add(1, Ordering::Relaxed);
-        if id >= self.config.operation_count {
+        if id >= INVALID_OP_BIT {
             return None;
         }
         Some(id)
@@ -104,7 +116,9 @@ impl WorkerContext {
         // `next_operation_id` does not represent the number of the operations
         // done, only the number of the operations issued. Subtract the
         // concurrency to get a good estimate.
-        let id = self.next_operation_id.load(Ordering::Relaxed);
+        // Clear the highest bit - the highest bit indicates that the bench
+        // was stopped due to timeout
+        let id = self.next_operation_id.load(Ordering::Relaxed) & !INVALID_OP_BIT;
         id.saturating_sub(self.config.concurrency.get() as u64)
     }
 
@@ -132,6 +146,12 @@ impl WorkerContext {
     pub fn get_combined_histogram_and_clear(&self) -> Histogram {
         self.histogram.get_combined_and_clear()
     }
+
+    /// Prevents more operations from being performed.
+    pub fn stop(&self) {
+        self.next_operation_id
+            .fetch_or(INVALID_OP_BIT, Ordering::Relaxed);
+    }
 }
 
 struct ProgressReporter {
@@ -140,6 +160,9 @@ struct ProgressReporter {
 
     previous_ops: u64,
     previous_report_time: Instant,
+    base_report_time: Instant,
+
+    total_histogram: Histogram,
 }
 
 impl ProgressReporter {
@@ -151,36 +174,51 @@ impl ProgressReporter {
 
             previous_ops: 0,
             previous_report_time: now,
+            base_report_time: now,
+
+            total_histogram: Histogram::new(),
         }
     }
 
-    pub async fn wait_and_print_report(&mut self) {
+    pub async fn wait_and_print_partial_report(&mut self) {
         let next = self.previous_report_time + REPORT_INTERVAL;
         tokio::time::sleep_until(next).await;
-        self.print_report(next);
+        self.print_report(next, false);
     }
 
-    pub fn print_report_now(&mut self) {
-        self.print_report(Instant::now());
+    pub fn print_full_report(&mut self) {
+        self.print_report(Instant::now(), true);
     }
 
-    fn print_report(&mut self, now: Instant) {
+    fn print_report(&mut self, now: Instant, full: bool) {
         let elapsed = now - self.start_time;
         let ops_done = self.context.get_operations_done_count();
 
-        let ops_delta = ops_done - self.previous_ops;
-        let time_delta = now - self.previous_report_time;
+        let ops_delta = if full {
+            ops_done
+        } else {
+            ops_done - self.previous_ops
+        };
+        let time_delta = if full {
+            now - self.base_report_time
+        } else {
+            now - self.previous_report_time
+        };
 
         let ops_per_sec = ops_delta as f64 / time_delta.as_secs_f64();
 
         let hist = self.context.get_combined_histogram_and_clear();
+        self.total_histogram.merge(&hist);
+        let hist = if full { &self.total_histogram } else { &hist };
         let p50 = hist.percentile(50.0).unwrap_or(0) as f64 / 1000.0;
         let p95 = hist.percentile(95.0).unwrap_or(0) as f64 / 1000.0;
         let p99 = hist.percentile(99.0).unwrap_or(0) as f64 / 1000.0;
+        let p999 = hist.percentile(99.9).unwrap_or(0) as f64 / 1000.0;
+        let max = hist.maximum().unwrap_or(0) as f64 / 1000.0;
 
         println!(
-            "{:?}: {} {}ops/s {:.3}ms {:.3}ms {:.3}ms",
-            elapsed, ops_done, ops_per_sec, p50, p95, p99
+            "{:?}: {} {}ops/s {:.3}ms {:.3}ms {:.3}ms {:.3}ms {:.3}ms",
+            elapsed, ops_done, ops_per_sec, p50, p95, p99, p999, max
         );
 
         self.previous_ops = ops_done;
@@ -189,25 +227,28 @@ impl ProgressReporter {
 }
 
 pub async fn run(config: Arc<BenchDescription>, strategy: Arc<dyn BenchStrategy>) -> Result<()> {
-    let session = SessionBuilder::new()
+    let mut session_builder = SessionBuilder::new()
         .known_nodes(&config.nodes)
         .tcp_nodelay(false) // TODO: Make configurable
-        .build()
-        .await?;
+        .compression(config.compression);
+    if let Some((username, password)) = &config.credentials {
+        session_builder = session_builder.user(username, password);
+    }
 
+    let session = session_builder.build().await?;
     let session = Arc::new(session);
 
     let op = strategy.prepare(session.clone()).await?;
 
     let context = Arc::new(WorkerContext::new(config.clone()));
-    let mut handles = Vec::with_capacity(config.concurrency.into());
+    let mut handles = FuturesUnordered::new();
 
     for _ in 0usize..config.concurrency.into() {
         let context = context.clone();
         let op = op.clone();
 
-        handles.push(async move {
-            let res: Result<Result<()>, tokio::task::JoinError> = tokio::spawn(async move {
+        handles.push({
+            let res: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
                 let mut prev_op_id = 0;
                 let mut gen = RngGen::new(0); // TODO: Support seeding
 
@@ -231,32 +272,37 @@ pub async fn run(config: Arc<BenchDescription>, strategy: Arc<dyn BenchStrategy>
                     context.mark_latency(end - start);
                 }
                 Ok(())
-            })
-            .await;
-            res.map_err(|err| err.into()).and_then(|res| res)
+            });
+            res
         });
     }
-
-    let wait_for_handles = futures::future::try_join_all(handles);
-    tokio::pin!(wait_for_handles);
 
     let mut progress_reporter = ProgressReporter::new(context.clone());
     let _catch_upper_handle = tokio::spawn(context.clone().run_catch_upper()).remote_handle();
 
-    loop {
+    let start_time = context.get_start_time();
+    let _stopper_handle = config.duration.map(move |duration| {
+        tokio::spawn(async move {
+            tokio::time::sleep_until(start_time + duration).await;
+            context.stop();
+        })
+        .remote_handle()
+    });
+
+    while !handles.is_empty() {
         tokio::select! {
             biased;
 
-            res = &mut wait_for_handles => {
-                res?;
+            res = &mut handles.next() => {
+                res.unwrap()??;
                 break;
             }
 
-            _ = progress_reporter.wait_and_print_report() => {}
+            _ = progress_reporter.wait_and_print_partial_report() => {}
         }
     }
 
-    progress_reporter.print_report_now();
+    progress_reporter.print_full_report();
 
     Ok(())
 }

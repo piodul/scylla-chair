@@ -17,8 +17,10 @@ use configuration::{scylla_bench, BenchDescription};
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let (bench_desc, bench_strategy) =
-        scylla_bench::parse_scylla_bench_args(std::env::args()).unwrap();
+    let result = scylla_bench::parse_scylla_bench_args(std::env::args()).unwrap();
+    if let Some((bench_desc, bench_strategy)) = result {
+        run::run(bench_desc, bench_strategy).await.unwrap();
+    }
 
     // TODO: Support parsing cassandra-stress style arguments
     // let config = Arc::new(BenchDescription {
@@ -28,6 +30,4 @@ async fn main() {
     //     rate_limit_per_second: None,
     //     nodes: vec!["127.0.0.1:9042".to_owned()],
     // });
-
-    run::run(bench_desc, bench_strategy).await.unwrap();
 }

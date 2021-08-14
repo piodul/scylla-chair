@@ -3,6 +3,7 @@ pub mod scylla_bench;
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -17,7 +18,9 @@ pub struct BenchDescription {
     pub nodes: Vec<String>,
 
     // pub consistency: Consistency,
-    pub operation_count: u64,
+    pub duration: Option<Duration>,
+    pub credentials: Option<(String, String)>,
+    pub compression: Option<scylla::transport::Compression>,
     pub concurrency: NonZeroUsize,
     pub rate_limit_per_second: Option<NonZeroU64>,
 }
