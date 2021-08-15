@@ -64,4 +64,3 @@ impl ValueGenerator for BlobGenerator {
         CqlValue::Blob(ret)
     }
 }
-

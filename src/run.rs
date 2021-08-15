@@ -23,6 +23,7 @@ struct WorkerContext {
     histogram: ShardedHistogram,
 
     start_time: Instant,
+    rows_written: AtomicU64,
 }
 
 struct RateLimiter {
@@ -97,6 +98,7 @@ impl WorkerContext {
             rate_limiter,
             histogram: ShardedHistogram::new(Default::default()),
             start_time: now,
+            rows_written: 0.into(),
         }
     }
 
@@ -120,6 +122,10 @@ impl WorkerContext {
         // was stopped due to timeout
         let id = self.next_operation_id.load(Ordering::Relaxed) & !INVALID_OP_BIT;
         id.saturating_sub(self.config.concurrency.get() as u64)
+    }
+
+    pub fn get_rows_written_count_ref(&self) -> &AtomicU64 {
+        &self.rows_written
     }
 
     pub async fn rate_limit(&self) -> Instant {
@@ -159,6 +165,7 @@ struct ProgressReporter {
     start_time: Instant,
 
     previous_ops: u64,
+    previous_rows: u64,
     previous_report_time: Instant,
     base_report_time: Instant,
 
@@ -173,6 +180,7 @@ impl ProgressReporter {
             start_time: now,
 
             previous_ops: 0,
+            previous_rows: 0,
             previous_report_time: now,
             base_report_time: now,
 
@@ -193,11 +201,20 @@ impl ProgressReporter {
     fn print_report(&mut self, now: Instant, full: bool) {
         let elapsed = now - self.start_time;
         let ops_done = self.context.get_operations_done_count();
+        let rows_done = self
+            .context
+            .get_rows_written_count_ref()
+            .load(Ordering::Relaxed);
 
         let ops_delta = if full {
             ops_done
         } else {
             ops_done - self.previous_ops
+        };
+        let rows_delta = if full {
+            rows_done
+        } else {
+            rows_done - self.previous_rows
         };
         let time_delta = if full {
             now - self.base_report_time
@@ -206,6 +223,7 @@ impl ProgressReporter {
         };
 
         let ops_per_sec = ops_delta as f64 / time_delta.as_secs_f64();
+        let rows_per_sec = rows_delta as f64 / time_delta.as_secs_f64();
 
         let hist = self.context.get_combined_histogram_and_clear();
         self.total_histogram.merge(&hist);
@@ -217,11 +235,12 @@ impl ProgressReporter {
         let max = hist.maximum().unwrap_or(0) as f64 / 1000.0;
 
         println!(
-            "{:?}: {} {}ops/s {:.3}ms {:.3}ms {:.3}ms {:.3}ms {:.3}ms",
-            elapsed, ops_done, ops_per_sec, p50, p95, p99, p999, max
+            "{:?}: {}ops {}ops/s {}rows {}rows/s {:.3}ms {:.3}ms {:.3}ms {:.3}ms {:.3}ms",
+            elapsed, ops_done, ops_per_sec, rows_done, rows_per_sec, p50, p95, p99, p999, max
         );
 
         self.previous_ops = ops_done;
+        self.previous_rows = rows_done;
         self.previous_report_time = now;
     }
 }
@@ -230,7 +249,8 @@ pub async fn run(config: Arc<BenchDescription>, strategy: Arc<dyn BenchStrategy>
     let mut session_builder = SessionBuilder::new()
         .known_nodes(&config.nodes)
         .tcp_nodelay(false) // TODO: Make configurable
-        .compression(config.compression);
+        .compression(config.compression)
+        .load_balancing(config.load_balancing_policy.clone());
     if let Some((username, password)) = &config.credentials {
         session_builder = session_builder.user(username, password);
     }
@@ -260,7 +280,7 @@ pub async fn run(config: Arc<BenchDescription>, strategy: Arc<dyn BenchStrategy>
 
                     let ctx = DistributionContext::new(op_id, gen.clone());
 
-                    match op.execute(ctx).await {
+                    match op.execute(ctx, context.get_rows_written_count_ref()).await {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(err) => {

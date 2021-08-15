@@ -2,7 +2,7 @@
 pub mod scylla_bench;
 
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -21,6 +21,7 @@ pub struct BenchDescription {
     pub duration: Option<Duration>,
     pub credentials: Option<(String, String)>,
     pub compression: Option<scylla::transport::Compression>,
+    pub load_balancing_policy: Arc<dyn scylla::load_balancing::LoadBalancingPolicy>,
     pub concurrency: NonZeroUsize,
     pub rate_limit_per_second: Option<NonZeroU64>,
 }
@@ -33,5 +34,5 @@ pub trait BenchStrategy {
 #[async_trait]
 pub trait BenchOp: Send + Sync {
     // TODO: Use std::ops::ControlFlow if it gets stabilized
-    async fn execute(&self, ctx: DistributionContext) -> Result<bool>;
+    async fn execute(&self, ctx: DistributionContext, rows_processed: &AtomicU64) -> Result<bool>;
 }
