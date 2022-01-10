@@ -167,8 +167,6 @@ struct ProgressReporter {
     previous_ops: u64,
     previous_rows: u64,
     previous_report_time: Instant,
-    base_report_time: Instant,
-
     total_histogram: Histogram,
 }
 
@@ -182,8 +180,6 @@ impl ProgressReporter {
             previous_ops: 0,
             previous_rows: 0,
             previous_report_time: now,
-            base_report_time: now,
-
             total_histogram: Histogram::new(),
         }
     }
@@ -216,28 +212,11 @@ impl ProgressReporter {
         } else {
             rows_done - self.previous_rows
         };
-        let time_delta = if full {
-            now - self.base_report_time
-        } else {
-            now - self.previous_report_time
-        };
-
-        let ops_per_sec = ops_delta as f64 / time_delta.as_secs_f64();
-        let rows_per_sec = rows_delta as f64 / time_delta.as_secs_f64();
 
         let hist = self.context.get_combined_histogram_and_clear();
         self.total_histogram.merge(&hist);
         let hist = if full { &self.total_histogram } else { &hist };
-        let p50 = hist.percentile(50.0).unwrap_or(0) as f64 / 1000.0;
-        let p95 = hist.percentile(95.0).unwrap_or(0) as f64 / 1000.0;
-        let p99 = hist.percentile(99.0).unwrap_or(0) as f64 / 1000.0;
-        let p999 = hist.percentile(99.9).unwrap_or(0) as f64 / 1000.0;
-        let max = hist.maximum().unwrap_or(0) as f64 / 1000.0;
-
-        println!(
-            "{:?}: {}ops {}ops/s {}rows {}rows/s {:.3}ms {:.3}ms {:.3}ms {:.3}ms {:.3}ms",
-            elapsed, ops_done, ops_per_sec, rows_done, rows_per_sec, p50, p95, p99, p999, max
-        );
+        ResultPrinter.print_partial_results(elapsed, ops_delta, rows_delta, 0, hist);
 
         self.previous_ops = ops_done;
         self.previous_rows = rows_done;
@@ -250,7 +229,13 @@ pub async fn run(config: Arc<BenchDescription>, strategy: Arc<dyn BenchStrategy>
         .known_nodes(&config.nodes)
         .tcp_nodelay(false) // TODO: Make configurable
         .compression(config.compression)
+        .ssl_context(config.ssl_context.clone())
         .load_balancing(config.load_balancing_policy.clone());
+    // .disallow_shard_aware_port(true)
+    // .pool_size(scylla::transport::session::PoolSize::PerShard(
+    //     std::num::NonZeroUsize::new(2).unwrap(),
+    // ));
+
     if let Some((username, password)) = &config.credentials {
         session_builder = session_builder.user(username, password);
     }
@@ -309,6 +294,8 @@ pub async fn run(config: Arc<BenchDescription>, strategy: Arc<dyn BenchStrategy>
         .remote_handle()
     });
 
+    ResultPrinter.print_header();
+
     while !handles.is_empty() {
         tokio::select! {
             biased;
@@ -325,4 +312,107 @@ pub async fn run(config: Arc<BenchDescription>, strategy: Arc<dyn BenchStrategy>
     progress_reporter.print_full_report();
 
     Ok(())
+}
+
+struct ResultPrinter;
+
+impl ResultPrinter {
+    fn print_header(&self) {
+        println!(
+            "{:10} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6}",
+            "time",
+            "ops/s",
+            "rows/s",
+            "errors",
+            "max",
+            "99.9th",
+            "99th",
+            "95th",
+            "90th",
+            "median",
+            "mean",
+        );
+    }
+
+    fn print_partial_results(
+        &self,
+        elapsed: Duration,
+        ops_delta: u64,
+        rows_delta: u64,
+        errors_delta: u64,
+        hist: &Histogram,
+    ) {
+        let p50 = Duration::from_micros(hist.percentile(50.0).unwrap_or(0));
+        let p90 = Duration::from_micros(hist.percentile(90.0).unwrap_or(0));
+        let p95 = Duration::from_micros(hist.percentile(95.0).unwrap_or(0));
+        let p99 = Duration::from_micros(hist.percentile(99.0).unwrap_or(0));
+        let p999 = Duration::from_micros(hist.percentile(99.9).unwrap_or(0));
+        let max = Duration::from_micros(hist.maximum().unwrap_or(0));
+        let mean = Duration::from_micros(hist.mean().unwrap_or(0));
+
+        println!(
+            "{:10} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6}",
+            format_duration(elapsed),
+            ops_delta,
+            rows_delta,
+            errors_delta,
+            format_duration(max),
+            format_duration(p999),
+            format_duration(p99),
+            format_duration(p95),
+            format_duration(p90),
+            format_duration(p50),
+            format_duration(mean),
+        );
+    }
+}
+
+// TODO: Move to utils
+// TODO: This could be realized as a custom formatter, without any allocations
+fn format_duration(d: Duration) -> String {
+    let mut ret = String::new();
+
+    if d == Duration::ZERO {
+        return "0".into();
+    }
+
+    if d >= Duration::from_secs(1) {
+        let minutes = (d.as_secs() / 60) % 60;
+        let hours = d.as_secs() / 3600;
+
+        if hours > 0 {
+            ret += &format!("{}h", hours);
+        }
+        if minutes > 0 {
+            ret += &format!("{}m", minutes);
+        }
+
+        // Print one digit of precision
+        let secs = d.as_secs_f64() % 60.0;
+        ret += &format!("{:.1}s", secs);
+    } else {
+        // Diverge a bit from scylla-bench: we will keep at most 3 digits of precision, always
+        let total_nanos = d.subsec_nanos();
+        let mut first_digit = 1_000_000_000;
+        let mut first_offset = 9;
+        while first_digit > 1 && total_nanos < first_digit {
+            first_digit /= 10;
+            first_offset -= 1;
+        }
+
+        let round_unit = std::cmp::max(first_digit / 100, 1);
+        let total_nanos = total_nanos - (total_nanos % round_unit);
+
+        if first_digit >= 1_000_000 {
+            let prec = 8 - first_offset;
+            ret = format!("{:.*}ms", prec, total_nanos as f64 / 1_000_000.0);
+        } else if first_digit >= 1_000 {
+            let prec = 5 - first_offset;
+            ret = format!("{:.*}μs", prec, total_nanos as f64 / 1_000.0);
+        } else {
+            ret = format!("{}ns", total_nanos);
+        }
+    }
+
+    ret
 }

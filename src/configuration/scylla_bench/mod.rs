@@ -1,6 +1,7 @@
 mod goflags;
 
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -9,6 +10,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use futures::StreamExt;
+use openssl::ssl::{SslContext, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode};
+use openssl::x509::verify::X509VerifyFlags;
 use rand_distr::{Distribution as _, StandardNormal, Uniform};
 use scylla::batch::{Batch, BatchType};
 use scylla::frame::{types::Consistency, value::Counter};
@@ -157,12 +160,29 @@ pub fn parse_scylla_bench_args(
 
     let show_help = flag.bool_var("help", false, "show this help message and exit");
 
-    // tlsEncryption
-    // serverName
-    // hostVerification
-    // caCertFile
-    // clientCertFile
-    // clientKeyFile
+    let tls_encryption = flag.bool_var(
+        "tls",
+        false,
+        "use TLS encryption for clien-coordinator communication",
+    );
+    let tls_server_name = flag.string_var("tls-server-name", "", "TLS server hostname");
+    let tls_host_verification =
+        flag.bool_var("tls-host-verification", false, "verify server certificate");
+    let tls_ca_cert_file = flag.string_var(
+        "tls-ca-cert-file",
+        "",
+        "path to CA certificate file, needed to enable encryption",
+    );
+    let tls_client_cert_file = flag.string_var(
+        "tls-client-cert-file",
+        "",
+        "path to client certificate file, needed to enable client certificate authentication",
+    );
+    let tls_client_key_file = flag.string_var(
+        "tls-client-key-file",
+        "",
+        "path to client key file, needed to enable client certificate authentication",
+    );
 
     let host_selection_policy = flag.var(
         "host-selection-policy",
@@ -216,7 +236,7 @@ pub fn parse_scylla_bench_args(
         }
     } else if read_mode_tweak_count > 1 {
         return Err(anyhow::anyhow!(
-            "in-restriction, no-lower-bound and provide-uppder-bound flags are mutually exclusive"
+            "in-restriction, no-lower-bound and provide-upper-bound flags are mutually exclusive"
         ));
     }
 
@@ -243,11 +263,44 @@ pub fn parse_scylla_bench_args(
         start_timestamp.get()
     };
 
+    let ssl_context = tls_encryption
+        .get()
+        .then(|| -> Result<SslContext> {
+            // TODO: Is everything here correct?
+
+            let mut context_builder = SslContextBuilder::new(SslMethod::tls())?;
+            if tls_host_verification.get() {
+                context_builder.set_verify(SslVerifyMode::PEER);
+            }
+            let ca_file = std::fs::canonicalize(tls_ca_cert_file.get())?;
+            context_builder.set_ca_file(ca_file.as_path())?;
+            if !tls_client_key_file.get().is_empty() && !tls_client_cert_file.get().is_empty() {
+                let key_file = std::fs::canonicalize(tls_client_key_file.get())?;
+                context_builder.set_private_key_file(key_file.as_path(), SslFiletype::PEM)?;
+                let ca_file = std::fs::canonicalize(tls_client_cert_file.get())?;
+                context_builder.set_certificate_file(ca_file.as_path(), SslFiletype::PEM)?;
+            }
+            // TODO
+            // if tls_host_verification.get() {
+            //     context_builder
+            //         .verify_param_mut()
+            //         .set_flags(X509VerifyFlags::ALWAYS_CHECK_SUBJECT);
+            // } else {
+            //     context_builder
+            //         .verify_param_mut()
+            //         .clear_flags(X509VerifyFlags::ALWAYS_CHECK_SUBJECT);
+            // }
+
+            Ok(context_builder.build())
+        })
+        .transpose()?;
+
     let desc = Arc::new(BenchDescription {
         nodes: nodes.get().split(',').map(str::to_owned).collect(),
         duration,
         credentials,
         compression,
+        ssl_context,
         load_balancing_policy: host_selection_policy.get(),
         concurrency: NonZeroUsize::new(concurrency.get() as usize).unwrap(), // TODO: Fix unwrap
         rate_limit_per_second: NonZeroU64::new(maximum_rate.get()),
@@ -434,14 +487,21 @@ impl BenchStrategy for ScyllaBenchStrategy {
         session.query(create_keyspace_query, ()).await?;
         session.await_schema_agreement().await?;
 
+        session.use_keyspace(&self.keyspace, true).await?;
+
         let create_table_query = format!(
-            "CREATE TABLE IF NOT EXISTS {}.{} (pk bigint, ck bigint, v blob, PRIMARY KEY(pk, ck)) WITH compression = {{ }}",
-            &self.keyspace, &self.table,
+            "CREATE TABLE IF NOT EXISTS {} (pk bigint, ck bigint, v blob, PRIMARY KEY(pk, ck)) WITH compression = {{ }}",
+            &self.table,
         );
-        let create_counter_table_query = format!(
-            "CREATE TABLE IF NOT EXISTS {}.test_counters (pk bigint, ck bigint, c1 counter, c2 counter, c3 counter, c4 counter, c5 counter, PRIMARY KEY(pk, ck)) WITH compression = {{ }}",
-            &self.keyspace,
-        );
+        // let create_table_query = format!(
+        //     "CREATE TABLE IF NOT EXISTS {}.{} (pk bigint, ck bigint, v blob, PRIMARY KEY(pk, ck)) WITH compression = {{ }}",
+        //     &self.keyspace, &self.table,
+        // );
+        let create_counter_table_query = "CREATE TABLE IF NOT EXISTS test_counters (pk bigint, ck bigint, c1 counter, c2 counter, c3 counter, c4 counter, c5 counter, PRIMARY KEY(pk, ck)) WITH compression = { }";
+        // let create_counter_table_query = format!(
+        //     "CREATE TABLE IF NOT EXISTS {}.test_counters (pk bigint, ck bigint, c1 counter, c2 counter, c3 counter, c4 counter, c5 counter, PRIMARY KEY(pk, ck)) WITH compression = {{ }}",
+        //     &self.keyspace,
+        // );
         futures::try_join!(
             session.query(create_table_query, ()),
             session.query(create_counter_table_query, ()),
@@ -580,10 +640,11 @@ impl WriteOp {
         workload: Box<dyn Workload>,
         clustering_row_size_dist: Arc<dyn Distribution>,
     ) -> impl std::future::Future<Output = Result<Self>> {
-        let insert_statement = format!(
-            "INSERT INTO {}.{} (pk, ck, v) VALUES (?, ?, ?)",
-            keyspace, table,
-        );
+        let insert_statement = format!("INSERT INTO {} (pk, ck, v) VALUES (?, ?, ?)", table,);
+        // let insert_statement = format!(
+        //     "INSERT INTO {}.{} (pk, ck, v) VALUES (?, ?, ?)",
+        //     keyspace, table,
+        // );
         async move {
             let mut statement = session.prepare(insert_statement).await?;
             statement.set_consistency(consistency_level);
@@ -622,7 +683,7 @@ impl BenchOp for WriteOp {
         } else {
             let mut batch = Batch::new(BatchType::Unlogged);
             batch.set_is_idempotent(true);
-            batch.set_consistency(self.statement.get_consistency());
+            batch.set_consistency(self.statement.get_consistency().unwrap());
             let mut vals = Vec::with_capacity(cks_count);
             for ck in cks {
                 let clustering_row_len = self.clustering_row_size_dist.get_u64(&mut ctx) as usize;
@@ -651,10 +712,11 @@ impl CounterUpdateOp {
         consistency_level: Consistency,
         workload: Box<dyn Workload>,
     ) -> impl std::future::Future<Output = Result<Self>> {
-        let insert_statement = format!(
-            "UPDATE {}.test_counters SET c1 = c1 + ?, c2 = c2 + ?, c3 = c3 + ?, c4 = c4 + ?, c5 = c5 + ? WHERE pk = ? AND ck = ?",
-            keyspace,
-        );
+        let insert_statement = "UPDATE {}.test_counters SET c1 = c1 + ?, c2 = c2 + ?, c3 = c3 + ?, c4 = c4 + ?, c5 = c5 + ? WHERE pk = ? AND ck = ?";
+        // let insert_statement = format!(
+        //     "UPDATE {}.test_counters SET c1 = c1 + ?, c2 = c2 + ?, c3 = c3 + ?, c4 = c4 + ?, c5 = c5 + ? WHERE pk = ? AND ck = ?",
+        //     keyspace,
+        // );
         async move {
             let mut statement = session.prepare(insert_statement).await?;
             statement.set_consistency(consistency_level);
@@ -700,7 +762,7 @@ impl BenchOp for CounterUpdateOp {
                 .await?;
         } else {
             let mut batch = Batch::new(BatchType::Counter);
-            batch.set_consistency(self.statement.get_consistency());
+            batch.set_consistency(self.statement.get_consistency().unwrap());
             let mut vals = Vec::with_capacity(cks_count);
             for ck in cks {
                 batch.append_statement(self.statement.clone());
@@ -774,14 +836,22 @@ impl ReadOp {
 
         let statement_text = if !is_counter {
             format!(
-                "SELECT ck, v FROM {}.{} WHERE pk = ? {}",
-                keyspace, table, ck_restriction,
+                "SELECT ck, v FROM {} WHERE pk = ? {}",
+                table, ck_restriction,
             )
+            // format!(
+            //     "SELECT ck, v FROM {}.{} WHERE pk = ? {}",
+            //     keyspace, table, ck_restriction,
+            // )
         } else {
             format!(
-                "SELECT ck, c1, c2, c3, c4, c5 FROM {}.test_counters WHERE pk = ? {}",
-                keyspace, ck_restriction,
+                "SELECT ck, c1, c2, c3, c4, c5 FROM test_counters WHERE pk = ? {}",
+                ck_restriction,
             )
+            // format!(
+            //     "SELECT ck, c1, c2, c3, c4, c5 FROM {}.test_counters WHERE pk = ? {}",
+            //     keyspace, ck_restriction,
+            // )
         };
 
         async move {

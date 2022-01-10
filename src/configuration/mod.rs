@@ -6,6 +6,7 @@ use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 
 use anyhow::Result;
+use openssl::ssl::SslContext;
 
 use scylla::Session;
 
@@ -21,6 +22,7 @@ pub struct BenchDescription {
     pub duration: Option<Duration>,
     pub credentials: Option<(String, String)>,
     pub compression: Option<scylla::transport::Compression>,
+    pub ssl_context: Option<SslContext>,
     pub load_balancing_policy: Arc<dyn scylla::load_balancing::LoadBalancingPolicy>,
     pub concurrency: NonZeroUsize,
     pub rate_limit_per_second: Option<NonZeroU64>,
